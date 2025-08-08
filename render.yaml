@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: line-clock-bot
+    env: node
+    plan: free
+    region: singapore
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      # 這兩個敏感值部署後到 Render 再手動填（sync: false 代表不要從 Git 同步）
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+
+      # 非敏感值可以直接版本控制
+      - key: SHEET_ID
+        value: 1i4JdcDrS8kUQa7gOIGJsf1Q4bzD_fViBkm9OfEZVkDQ
+      - key: WORK_HOURS
+        value: "8"
+      - key: LUNCH_MINUTES
+        value: "60"
+      - key: TIMEZONE
+        value: Asia/Taipei
