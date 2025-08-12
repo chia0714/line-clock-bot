@@ -5,7 +5,8 @@ import line from '@line/bot-sdk';
 import {
   ensureHeaders,
   appendClockRecord,
-  appendLeaveRecord
+  appendLeaveRecord,
+  getRecentRecords
 } from './googleSheets.js';
 
 const app = express();
@@ -39,7 +40,7 @@ function fmtDate(d) {
   return `${y}/${m}/${da}`;
 }
 
-// Flex 卡片
+// Flex：打卡成功卡片
 function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay='—' }) {
   return {
     type: "flex",
@@ -111,7 +112,7 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
                     type: "button",
                     style: "link",
                     height: "sm",
-                    action: { type: "message", label: "查看出勤紀錄", text: "查看出勤紀錄" }
+                    action: { type: "message", label: "出勤記錄", text: "出勤記錄" }
                   },
                   {
                     type: "button",
@@ -129,6 +130,38 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
   };
 }
 
+// Flex：最近出勤紀錄列表
+function buildRecordsFlex(records) {
+  const items = records.map(r => ({
+    type: "box",
+    layout: "baseline",
+    spacing: "sm",
+    contents: [
+      { type: "text", text: r.date || "-", size: "sm", color: "#64748B", flex: 4 },
+      { type: "text", text: `${r.start || '-'} → ${r.end || '-'}`, size: "sm", color: "#0F172A", flex: 4 }
+    ]
+  }));
+  return {
+    type: "flex",
+    altText: "最近出勤紀錄",
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        paddingAll: "16px",
+        contents: [
+          { type: "text", text: "最近出勤紀錄", weight: "bold", size: "md", color: "#0F172A" },
+          { type: "separator", margin: "sm", color: "#E2E8F0" },
+          { type: "box", layout: "vertical", margin: "md", spacing: "xs", contents: items.length ? items : [
+            { type: "text", text: "尚無出勤紀錄。", size: "sm", color: "#64748B" }
+          ]}
+        ]
+      }
+    }
+  };
+}
+
 // Webhook
 app.post('/webhook', line.middleware(config), async (req, res) => {
   try {
@@ -136,7 +169,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
     res.status(200).send('OK');
   } catch (e) {
     console.error('handleEvent error:', e);
-    res.status(200).send('OK'); // 固定回 200
+    res.status(200).send('OK');
   }
 });
 
@@ -145,7 +178,7 @@ async function handleEvent(event) {
     if (event.replyToken) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '目前僅支援文字，請點「我要打卡」或「我要請假」。'
+        text: '目前僅支援文字，請點「我要打卡／我要請假／出勤記錄」。'
       });
     }
     return null;
@@ -156,11 +189,12 @@ async function handleEvent(event) {
 
   const isClockIn = ['打卡上班', '我要打卡', '打卡', '/clockin'].includes(text);
   const isLeave   = ['我要請假', '請假', '/leave'].includes(text);
+  const isRecords = ['出勤記錄', '查看出勤紀錄', '/records'].includes(text);
 
-  if (!isClockIn && !isLeave) {
+  if (!isClockIn && !isLeave && !isRecords) {
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: '請點選下方選單：「我要打卡」或「我要請假」。'
+      text: '請點選下方選單：「我要打卡」、「我要請假」或「出勤記錄」。'
     });
   }
 
@@ -170,7 +204,7 @@ async function handleEvent(event) {
   const dateStr = fmtDate(now);
 
   if (isClockIn) {
-    const minutes = Number(process.env.WORK_HOURS || 8) * 60 + Number(process.env.LUNCH_MINUTES || 60);
+    const minutes = Number(WORK_HOURS) * 60 + Number(LUNCH_MINUTES);
     const off = new Date(now.getTime() + minutes * 60 * 1000);
     const startStr = fmtTime(now);
     const endStr = fmtTime(off);
@@ -200,6 +234,17 @@ async function handleEvent(event) {
 
     const msg = `📅 請假完成\n今日狀態已更新為「請假」。`;
     return client.replyMessage(event.replyToken, { type: 'text', text: msg });
+  }
+
+  if (isRecords) {
+    try {
+      const list = await getRecentRecords(userId, 5);
+      const flex = buildRecordsFlex(list);
+      return client.replyMessage(event.replyToken, flex);
+    } catch (e) {
+      console.error('getRecentRecords error:', e);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '讀取出勤紀錄時發生錯誤，稍後再試。' });
+    }
   }
 }
 

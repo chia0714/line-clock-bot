@@ -59,3 +59,23 @@ export async function appendLeaveRecord({ userId, dateStr }) {
     requestBody: { values: [[userId, dateStr, '', '今天請假']] }
   });
 }
+
+// 讀取該 userId 的最近 N 筆紀錄（倒序）
+export async function getRecentRecords(userId, limit = 5) {
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: '打卡紀錄!A:D'
+  });
+  const rows = res.data.values || [];
+  if (rows.length <= 1) return [];
+  const data = rows.slice(1); // 去表頭
+  const result = [];
+  for (let i = data.length - 1; i >= 0 && result.length < limit; i--) {
+    const [uid, date, start, end] = data[i];
+    if (uid === userId) {
+      result.push({ date, start, end });
+    }
+  }
+  return result;
+}
