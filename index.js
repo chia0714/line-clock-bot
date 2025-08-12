@@ -18,7 +18,8 @@ const {
   PORT = 3000,
   WORK_HOURS = 8,
   LUNCH_MINUTES = 60,
-  TIMEZONE = 'Asia/Taipei'
+  TIMEZONE = 'Asia/Taipei',
+  OWNER_USER_ID
 } = process.env;
 
 const config = {
@@ -40,29 +41,16 @@ function fmtDate(d) {
   return `${y}/${m}/${da}`;
 }
 
-// 轉「YYYY/MM/DD」或其他可解析字串 -> 「YYYY年M月D日」
+// 轉 YYYY/MM/DD -> YYYY年M月D日（用於出勤記錄顯示）
 function toChineseDate(dateStr) {
-  if (!dateStr) return '';
-  // 優先處理 YYYY/MM/DD
   const m = String(dateStr).match(/^(\d{4})[\/](\d{1,2})[\/](\d{1,2})$/);
-  let y, mo, d;
-  if (m) {
-    y = parseInt(m[1], 10);
-    mo = parseInt(m[2], 10);
-    d = parseInt(m[3], 10);
-  } else {
-    const dt = new Date(dateStr);
-    if (!isNaN(dt)) {
-      y = dt.getFullYear();
-      mo = dt.getMonth() + 1;
-      d = dt.getDate();
-    }
-  }
-  if (y && mo && d) return `${y}年${mo}月${d}日`;
-  return dateStr; // fallback
+  if (m) return `${Number(m[1])}年${Number(m[2])}月${Number(m[3])}日`;
+  const dt = new Date(dateStr);
+  if (!isNaN(dt)) return `${dt.getFullYear()}年${dt.getMonth()+1}月${dt.getDate()}日`;
+  return dateStr;
 }
 
-// Flex：打卡成功卡片（維持不變）
+// Flex：打卡成功卡片
 function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay='—' }) {
   return {
     type: "flex",
@@ -152,7 +140,7 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
   };
 }
 
-// Flex：最近出勤紀錄列表（改為「YYYY年M月D日 → 上班時間或今天請假」）
+// Flex：最近出勤紀錄（中文日期＋只顯示上班時間或今天請假）
 function buildRecordsFlex(records) {
   const items = records.map(r => {
     const isLeave = (r.end && r.end.includes('今天請假')) || (r.start === '-' || r.start === '');
@@ -160,7 +148,6 @@ function buildRecordsFlex(records) {
                          : `${toChineseDate(r.date)} → ${r.start || '-'}`;
     return { type: "text", text: line, size: "sm", color: "#0F172A", wrap: true };
   });
-
   return {
     type: "flex",
     altText: "最近出勤紀錄",
@@ -181,7 +168,11 @@ function buildRecordsFlex(records) {
   };
 }
 
-// Webhook（保留原本打卡/請假/出勤記錄流程）
+function isOwner(uid) {
+  return uid && OWNER_USER_ID && uid === OWNER_USER_ID;
+}
+
+// Webhook
 app.post('/webhook', line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
@@ -205,17 +196,60 @@ async function handleEvent(event) {
 
   const raw = (event.message.text || '').trim();
   const text = raw.replace(/\s/g, '');
+  const userId = event.source?.userId || 'unknown';
 
+  // 特殊指令：/whoami 取得 userId（設定白名單/家人）
+  if (['/whoami','我的代號'].includes(text)) {
+    return client.replyMessage(event.replyToken, { type: 'text', text: userId });
+  }
+
+  // 管理指令：/whichmenu （僅 OWNER）
+  if (['/whichmenu', '我的選單'].includes(text)) {
+    if (!isOwner(userId)) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: '只有本人可以查詢喔～' });
+    }
+    try {
+      const personal = await client.getRichMenuIdOfUser(userId).catch(() => null);
+      const defaultId = await client.getDefaultRichMenuId().catch(() => null);
+      const list = await client.getRichMenuList().catch(() => ({ richmenus: [] }));
+      const lines = [];
+      lines.push(`👤 你的個人 Rich Menu：${personal || '（未指派，使用預設）'}`);
+      lines.push(`⭐ 預設 Rich Menu：${defaultId || '（未設定）'}`);
+      if (list.richmenus && list.richmenus.length) {
+        lines.push('📋 目前存在的 Rich Menu：');
+        list.richmenus.forEach((m, i) => {
+          lines.push(`${i+1}. ${m.richMenuId}｜${m.name || '(no name)'}｜${m.size?.width}x${m.size?.height}`);
+        });
+      }
+      return client.replyMessage(event.replyToken, { type: 'text', text: lines.join('\n') });
+    } catch (e) {
+      console.error('whichmenu error:', e);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '查詢選單時發生錯誤。' });
+    }
+  }
+
+  // 同義字（含 /clockin、/leave、/records）
   const isClockIn = ['打卡上班', '我要打卡', '打卡', '/clockin'].includes(text);
   const isLeave   = ['我要請假', '請假', '/leave'].includes(text);
   const isRecords = ['出勤記錄', '查看出勤紀錄', '/records'].includes(text);
 
-  if (!isClockIn && !isLeave && !isRecords) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: '請點選單：「我要打卡／我要請假／出勤記錄」。' });
+  // 權限管控：只有 OWNER 可用三大功能
+  if (isClockIn || isLeave || isRecords) {
+    if (!isOwner(userId)) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '這些功能僅限本人使用喔～你會在每天 17:30 收到他的下班時間通知。'
+      });
+    }
+  } else {
+    // 其他訊息：友善引導
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '請點選單：「我要打卡」、「我要請假」或「出勤記錄」。'
+    });
   }
 
   await ensureHeaders();
-  const userId = event.source?.userId || 'unknown';
   const now = new Date();
   const dateStr = fmtDate(now);
 
@@ -225,15 +259,28 @@ async function handleEvent(event) {
     const startStr = fmtTime(now);
     const endStr = fmtTime(off);
 
-    try { await appendClockRecord({ userId, dateStr, startStr, endStr }); } catch (e) { console.error(e); }
+    try {
+      await appendClockRecord({ userId, dateStr, startStr, endStr });
+    } catch (e) {
+      console.error('appendClockRecord error:', e);
+    }
+
     const flex = buildClockInFlex({
-      timeStr: startStr, dateStr, location: '台北辦公室（GPS）', note: `最早下班 ${endStr}`, delay: '—'
+      timeStr: startStr,
+      dateStr,
+      location: '台北辦公室（GPS）',
+      note: `最早下班 ${endStr}`,
+      delay: '—'
     });
     return client.replyMessage(event.replyToken, flex);
   }
 
   if (isLeave) {
-    try { await appendLeaveRecord({ userId, dateStr }); } catch (e) { console.error(e); }
+    try {
+      await appendLeaveRecord({ userId, dateStr });
+    } catch (e) {
+      console.error('appendLeaveRecord error:', e);
+    }
     return client.replyMessage(event.replyToken, { type: 'text', text: '📅 請假完成\n今日狀態已更新為「請假」。' });
   }
 
