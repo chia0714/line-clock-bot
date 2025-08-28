@@ -6,7 +6,12 @@ import {
   ensureHeaders,
   appendClockRecord,
   appendLeaveRecord,
-  getRecentRecords
+  getRecentRecords,
+  hasRecordForDate,
+  ensureScheduleHeaders,
+  scheduleNotification,
+  getDueNotifications,
+  markNotified
 } from './googleSheets.js';
 
 const app = express();
@@ -18,7 +23,12 @@ const {
   PORT = 3000,
   WORK_HOURS = 8,
   LUNCH_MINUTES = 60,
-  TIMEZONE = 'Asia/Taipei'
+  TIMEZONE = 'Asia/Taipei',
+  ALLOWED_USER_IDS = '',
+  FAMILY_USER_IDS = '',
+  FAMILY_GROUP_IDS = '',
+  FAMILY_NOTIFY_LEAD_MINUTES = 15,
+  NOTIFY_FIRST_CLOCK_ONLY = '1'
 } = process.env;
 
 const config = {
@@ -27,9 +37,15 @@ const config = {
 };
 const client = new line.Client(config);
 
-// 健康檢查
-app.get('/', (_req, res) => res.status(200).send('OK'));
+// ---------- 白名單（僅允許本人使用功能） ----------
+const ALLOWED = new Set(ALLOWED_USER_IDS.split(',').map(s => s.trim()).filter(Boolean));
+const WHITELIST_MODE = ALLOWED.size > 0;
+function isEmployee(userId) {
+  if (!WHITELIST_MODE) return true; // 未設定白名單 → 全員可用
+  return ALLOWED.has(userId);
+}
 
+// ---------- 工具：時間格式 ----------
 function fmtTime(d) {
   return d.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE });
 }
@@ -39,30 +55,24 @@ function fmtDate(d) {
   const da = d.toLocaleString('zh-TW', { day: '2-digit', timeZone: TIMEZONE });
   return `${y}/${m}/${da}`;
 }
-
-// 轉「YYYY/MM/DD」或其他可解析字串 -> 「YYYY年M月D日」
-function toChineseDate(dateStr) {
-  if (!dateStr) return '';
-  // 優先處理 YYYY/MM/DD
-  const m = String(dateStr).match(/^(\d{4})[\/](\d{1,2})[\/](\d{1,2})$/);
-  let y, mo, d;
-  if (m) {
-    y = parseInt(m[1], 10);
-    mo = parseInt(m[2], 10);
-    d = parseInt(m[3], 10);
-  } else {
-    const dt = new Date(dateStr);
-    if (!isNaN(dt)) {
-      y = dt.getFullYear();
-      mo = dt.getMonth() + 1;
-      d = dt.getDate();
-    }
-  }
-  if (y && mo && d) return `${y}年${mo}月${d}日`;
-  return dateStr; // fallback
+function fmtDateChinese(d) {
+  const dt = (d instanceof Date) ? d : new Date(d);
+  return `${dt.getFullYear()}年${dt.getMonth() + 1}月${dt.getDate()}日`;
 }
 
-// Flex：打卡成功卡片（維持不變）
+// ---------- 推播給家人（個人／群組） ----------
+async function notifyFamily(text) {
+  const userIds = FAMILY_USER_IDS.split(',').map(s => s.trim()).filter(Boolean);
+  const groupIds = FAMILY_GROUP_IDS.split(',').map(s => s.trim()).filter(Boolean);
+  const msg = [{ type: 'text', text }];
+  const tasks = [
+    ...userIds.map(id => client.pushMessage(id, msg)),
+    ...groupIds.map(id => client.pushMessage(id, msg))
+  ];
+  if (tasks.length) await Promise.allSettled(tasks);
+}
+
+// ---------- Flex 卡片 ----------
 function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay='—' }) {
   return {
     type: "flex",
@@ -98,30 +108,18 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
                 margin: "md",
                 spacing: "xs",
                 contents: [
-                  {
-                    type: "box",
-                    layout: "baseline",
-                    contents: [
+                  { type: "box", layout: "baseline", contents: [
                       { type: "text", text: "打卡地點", size: "sm", color: "#64748B", flex: 2 },
                       { type: "text", text: location, size: "sm", color: "#0F172A", flex: 5, wrap: true }
-                    ]
-                  },
-                  {
-                    type: "box",
-                    layout: "baseline",
-                    contents: [
+                  ]},
+                  { type: "box", layout: "baseline", contents: [
                       { type: "text", text: "備註", size: "sm", color: "#64748B", flex: 2 },
                       { type: "text", text: note, size: "sm", color: "#0F172A", flex: 5, wrap: true }
-                    ]
-                  },
-                  {
-                    type: "box",
-                    layout: "baseline",
-                    contents: [
+                  ]},
+                  { type: "box", layout: "baseline", contents: [
                       { type: "text", text: "異常紀錄", size: "sm", color: "#64748B", flex: 2 },
                       { type: "text", text: delay, size: "sm", color: "#0F172A", flex: 5 }
-                    ]
-                  }
+                  ]}
                 ]
               },
               {
@@ -130,18 +128,10 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
                 margin: "md",
                 spacing: "sm",
                 contents: [
-                  {
-                    type: "button",
-                    style: "link",
-                    height: "sm",
-                    action: { type: "message", label: "出勤記錄", text: "出勤記錄" }
-                  },
-                  {
-                    type: "button",
-                    style: "link",
-                    height: "sm",
-                    action: { type: "message", label: "我要請假", text: "我要請假" }
-                  }
+                  { type: "button", style: "link", height: "sm",
+                    action: { type: "message", label: "出勤記錄", text: "出勤記錄" } },
+                  { type: "button", style: "link", height: "sm",
+                    action: { type: "message", label: "我要請假", text: "我要請假" } }
                 ]
               }
             ]
@@ -152,15 +142,16 @@ function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay=
   };
 }
 
-// Flex：最近出勤紀錄列表（改為「YYYY年M月D日 → 上班時間或今天請假」）
 function buildRecordsFlex(records) {
-  const items = records.map(r => {
-    const isLeave = (r.end && r.end.includes('今天請假')) || (r.start === '-' || r.start === '');
-    const line = isLeave ? `${toChineseDate(r.date)} → 今天請假`
-                         : `${toChineseDate(r.date)} → ${r.start || '-'}`;
-    return { type: "text", text: line, size: "sm", color: "#0F172A", wrap: true };
-  });
-
+  const items = records.map(r => ({
+    type: "box",
+    layout: "baseline",
+    spacing: "sm",
+    contents: [
+      { type: "text", text: r.dateZh || "-", size: "sm", color: "#64748B", flex: 6 },
+      { type: "text", text: r.leave ? r.leave : (r.start || '-'), size: "sm", color: "#0F172A", flex: 4 }
+    ]
+  }));
   return {
     type: "flex",
     altText: "最近出勤紀錄",
@@ -173,15 +164,60 @@ function buildRecordsFlex(records) {
         contents: [
           { type: "text", text: "最近出勤紀錄", weight: "bold", size: "md", color: "#0F172A" },
           { type: "separator", margin: "sm", color: "#E2E8F0" },
-          { type: "box", layout: "vertical", margin: "md", spacing: "xs",
-            contents: items.length ? items : [{ type: "text", text: "尚無出勤紀錄。", size: "sm", color: "#64748B" }]}
+          { type: "box", layout: "vertical", margin: "md", spacing: "xs", contents: items.length ? items : [
+            { type: "text", text: "尚無出勤紀錄。", size: "sm", color: "#64748B" }
+          ]}
         ]
       }
     }
   };
 }
 
-// Webhook（保留原本打卡/請假/出勤記錄流程）
+// ---------- 便捷取得使用者/群組 ID ----------
+async function replyIdHelpers(event, text) {
+  if (['/myid','綁定個人通知'].includes(text) && event.source?.userId) {
+    return client.replyMessage(event.replyToken, { type: 'text', text: event.source.userId });
+  }
+  if (['/groupid','綁定群組通知'].includes(text)) {
+    const gid = event.source?.groupId || event.source?.roomId;
+    if (gid) return client.replyMessage(event.replyToken, { type: 'text', text: gid });
+  }
+  return null;
+}
+
+// ---------- 定時檢查排程並推播 ----------
+async function checkAndNotifyDue() {
+  try {
+    await ensureScheduleHeaders();
+    const nowISO = new Date().toISOString();
+    const due = await getDueNotifications(nowISO);
+    if (!due.length) return;
+    const tasks = due.map(async item => {
+      const endStr = new Date(item.offISO).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE });
+      const text =
+        `📣 即將到達最早下班時間\n` +
+        `📅 ${item.dateZh}\n` +
+        `🕗 上班：${item.startStr}\n` +
+        `🕔 最早下班：${endStr}`;
+      await notifyFamily(text);
+      await markNotified(item.rowIndex);
+    });
+    await Promise.allSettled(tasks);
+  } catch (e) {
+    console.error('checkAndNotifyDue error:', e);
+  }
+}
+
+// 每 60 秒檢查一次（Render 若休眠則需外部喚醒或升級方案以確保常駐）
+setInterval(checkAndNotifyDue, 60 * 1000);
+
+// 手動觸發（方便用瀏覽器或 Render Cron Ping）
+app.get('/tasks/notify-due', async (_req, res) => {
+  await checkAndNotifyDue();
+  res.status(200).send('OK');
+});
+
+// ---------- Webhook ----------
 app.post('/webhook', line.middleware(config), async (req, res) => {
   try {
     await Promise.all(req.body.events.map(handleEvent));
@@ -197,7 +233,7 @@ async function handleEvent(event) {
     if (event.replyToken) {
       return client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '請點「我要打卡／我要請假／出勤記錄」。'
+        text: '目前僅支援文字，請點「我要打卡／我要請假／出勤記錄」。'
       });
     }
     return null;
@@ -205,17 +241,26 @@ async function handleEvent(event) {
 
   const raw = (event.message.text || '').trim();
   const text = raw.replace(/\s/g, '');
+  const userId = event.source?.userId || 'unknown';
+
+  // 便捷取得ID
+  const idHelper = await replyIdHelpers(event, text);
+  if (idHelper) return idHelper;
 
   const isClockIn = ['打卡上班', '我要打卡', '打卡', '/clockin'].includes(text);
   const isLeave   = ['我要請假', '請假', '/leave'].includes(text);
   const isRecords = ['出勤記錄', '查看出勤紀錄', '/records'].includes(text);
 
-  if (!isClockIn && !isLeave && !isRecords) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: '請點選單：「我要打卡／我要請假／出勤記錄」。' });
+  const isProtectedCmd = isClockIn || isLeave || isRecords;
+
+  // 白名單限制（僅本人可用）
+  if (isProtectedCmd && !isEmployee(userId)) {
+    return client.replyMessage(event.replyToken, { type: 'text', text: '此功能僅限本人使用。' });
   }
 
   await ensureHeaders();
-  const userId = event.source?.userId || 'unknown';
+  await ensureScheduleHeaders();
+
   const now = new Date();
   const dateStr = fmtDate(now);
 
@@ -225,28 +270,74 @@ async function handleEvent(event) {
     const startStr = fmtTime(now);
     const endStr = fmtTime(off);
 
-    try { await appendClockRecord({ userId, dateStr, startStr, endStr }); } catch (e) { console.error(e); }
+    // 僅在當天第一筆打卡時建立排程（可用 NOTIFY_FIRST_CLOCK_ONLY 控制）
+    let shouldSchedule = true;
+    if (NOTIFY_FIRST_CLOCK_ONLY === '1') {
+      try {
+        const already = await hasRecordForDate(userId, dateStr);
+        shouldSchedule = !already;
+      } catch (e) {
+        console.error('hasRecordForDate error:', e);
+      }
+    }
+
+    try {
+      await appendClockRecord({ userId, dateStr, startStr, endStr });
+    } catch (e) {
+      console.error('appendClockRecord error:', e);
+    }
+
+    if (shouldSchedule) {
+      const leadMin = Number(FAMILY_NOTIFY_LEAD_MINUTES) || 15;
+      const notifyAt = new Date(off.getTime() - leadMin * 60 * 1000);
+      await scheduleNotification({
+        userId,
+        dateStr,
+        startStr,
+        offISO: off.toISOString(),
+        notifyISO: notifyAt.toISOString(),
+      });
+    }
+
     const flex = buildClockInFlex({
-      timeStr: startStr, dateStr, location: '台北辦公室（GPS）', note: `最早下班 ${endStr}`, delay: '—'
+      timeStr: startStr,
+      dateStr,
+      location: '台北辦公室（GPS）',
+      note: `最早下班 ${endStr}`,
+      delay: '—'
     });
     return client.replyMessage(event.replyToken, flex);
   }
 
   if (isLeave) {
-    try { await appendLeaveRecord({ userId, dateStr }); } catch (e) { console.error(e); }
-    return client.replyMessage(event.replyToken, { type: 'text', text: '📅 請假完成\n今日狀態已更新為「請假」。' });
+    try {
+      await appendLeaveRecord({ userId, dateStr });
+    } catch (e) {
+      console.error('appendLeaveRecord error:', e);
+    }
+    return client.replyMessage(event.replyToken, { type: 'text', text: `📅 請假完成\n今日狀態已更新為「請假」。` });
   }
 
   if (isRecords) {
     try {
       const list = await getRecentRecords(userId, 5);
-      const flex = buildRecordsFlex(list);
+      const mapped = list.map(r => ({
+        dateZh: fmtDateChinese(r.date),
+        start: r.start,
+        leave: r.end === '今天請假' ? '今天請假' : undefined
+      }));
+      const flex = buildRecordsFlex(mapped);
       return client.replyMessage(event.replyToken, flex);
     } catch (e) {
       console.error('getRecentRecords error:', e);
       return client.replyMessage(event.replyToken, { type: 'text', text: '讀取出勤紀錄時發生錯誤，稍後再試。' });
     }
   }
+
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: '請點選下方選單：「我要打卡」、「我要請假」或「出勤記錄」。'
+  });
 }
 
 app.listen(PORT, () => console.log('✅ Server running on port ' + PORT));
