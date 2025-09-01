@@ -28,7 +28,9 @@ const {
   FAMILY_USER_IDS = '',
   FAMILY_GROUP_IDS = '',
   FAMILY_NOTIFY_LEAD_MINUTES = 15,
-  NOTIFY_FIRST_CLOCK_ONLY = '1'
+  NOTIFY_FIRST_CLOCK_ONLY = '1',
+  CRON_KEY = '',
+  NOTIFY_MAX_LAG_MINUTES = '240'
 } = process.env;
 
 const config = {
@@ -37,15 +39,18 @@ const config = {
 };
 const client = new line.Client(config);
 
-// ---------- 白名單（僅允許本人使用功能） ----------
+// Health check
+app.get('/', (_req, res) => res.status(200).send('OK'));
+
+// ---------- 白名單 ----------
 const ALLOWED = new Set(ALLOWED_USER_IDS.split(',').map(s => s.trim()).filter(Boolean));
 const WHITELIST_MODE = ALLOWED.size > 0;
 function isEmployee(userId) {
-  if (!WHITELIST_MODE) return true; // 未設定白名單 → 全員可用
+  if (!WHITELIST_MODE) return true;
   return ALLOWED.has(userId);
 }
 
-// ---------- 工具：時間格式 ----------
+// ---------- 工具 ----------
 function fmtTime(d) {
   return d.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE });
 }
@@ -60,7 +65,7 @@ function fmtDateChinese(d) {
   return `${dt.getFullYear()}年${dt.getMonth() + 1}月${dt.getDate()}日`;
 }
 
-// ---------- 推播給家人（個人／群組） ----------
+// ---------- 推播 ----------
 async function notifyFamily(text) {
   const userIds = FAMILY_USER_IDS.split(',').map(s => s.trim()).filter(Boolean);
   const groupIds = FAMILY_GROUP_IDS.split(',').map(s => s.trim()).filter(Boolean);
@@ -72,7 +77,7 @@ async function notifyFamily(text) {
   if (tasks.length) await Promise.allSettled(tasks);
 }
 
-// ---------- Flex 卡片 ----------
+// ---------- Flex ----------
 function buildClockInFlex({ timeStr, dateStr, location='—', note='—', delay='—' }) {
   return {
     type: "flex",
@@ -173,7 +178,7 @@ function buildRecordsFlex(records) {
   };
 }
 
-// ---------- 便捷取得使用者/群組 ID ----------
+// ---------- 便捷 ID ----------
 async function replyIdHelpers(event, text) {
   if (['/myid','綁定個人通知'].includes(text) && event.source?.userId) {
     return client.replyMessage(event.replyToken, { type: 'text', text: event.source.userId });
@@ -185,14 +190,23 @@ async function replyIdHelpers(event, text) {
   return null;
 }
 
-// ---------- 定時檢查排程並推播 ----------
+// ---------- 定時檢查並推播 ----------
 async function checkAndNotifyDue() {
   try {
     await ensureScheduleHeaders();
     const nowISO = new Date().toISOString();
     const due = await getDueNotifications(nowISO);
     if (!due.length) return;
+
+    const MAX_LAG_MIN = Number(NOTIFY_MAX_LAG_MINUTES || 240);
+
     const tasks = due.map(async item => {
+      // 過期太久就不補發，只標記已通知以防止重複
+      const lagMs = Date.now() - new Date(item.offISO).getTime();
+      if (lagMs > MAX_LAG_MIN * 60 * 1000) {
+        await markNotified(item.rowIndex);
+        return;
+      }
       const endStr = new Date(item.offISO).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE });
       const text =
         `📣 即將到達最早下班時間\n` +
@@ -208,11 +222,15 @@ async function checkAndNotifyDue() {
   }
 }
 
-// 每 60 秒檢查一次（Render 若休眠則需外部喚醒或升級方案以確保常駐）
+// 每 60 秒檢查一次；服務啟動時先掃一次
 setInterval(checkAndNotifyDue, 60 * 1000);
+checkAndNotifyDue();
 
-// 手動觸發（方便用瀏覽器或 Render Cron Ping）
-app.get('/tasks/notify-due', async (_req, res) => {
+// 手動 / Cron 觸發（帶密碼保護）
+app.get('/tasks/notify-due', async (req, res) => {
+  if (CRON_KEY && req.query.key !== CRON_KEY) {
+    return res.status(403).send('Forbidden');
+  }
   await checkAndNotifyDue();
   res.status(200).send('OK');
 });
@@ -250,16 +268,15 @@ async function handleEvent(event) {
   const isClockIn = ['打卡上班', '我要打卡', '打卡', '/clockin'].includes(text);
   const isLeave   = ['我要請假', '請假', '/leave'].includes(text);
   const isRecords = ['出勤記錄', '查看出勤紀錄', '/records'].includes(text);
-
   const isProtectedCmd = isClockIn || isLeave || isRecords;
 
-  // 白名單限制（僅本人可用）
+  // 白名單限制
   if (isProtectedCmd && !isEmployee(userId)) {
     return client.replyMessage(event.replyToken, { type: 'text', text: '此功能僅限本人使用。' });
-  }
+    }
 
   await ensureHeaders();
-  await ensureScheduleHeaders();
+  try { await ensureScheduleHeaders(); } catch (e) { console.error('ensureScheduleHeaders error:', e); }
 
   const now = new Date();
   const dateStr = fmtDate(now);
@@ -270,7 +287,6 @@ async function handleEvent(event) {
     const startStr = fmtTime(now);
     const endStr = fmtTime(off);
 
-    // 僅在當天第一筆打卡時建立排程（可用 NOTIFY_FIRST_CLOCK_ONLY 控制）
     let shouldSchedule = true;
     if (NOTIFY_FIRST_CLOCK_ONLY === '1') {
       try {
@@ -290,13 +306,17 @@ async function handleEvent(event) {
     if (shouldSchedule) {
       const leadMin = Number(FAMILY_NOTIFY_LEAD_MINUTES) || 15;
       const notifyAt = new Date(off.getTime() - leadMin * 60 * 1000);
-      await scheduleNotification({
-        userId,
-        dateStr,
-        startStr,
-        offISO: off.toISOString(),
-        notifyISO: notifyAt.toISOString(),
-      });
+      try {
+        await scheduleNotification({
+          userId,
+          dateStr,
+          startStr,
+          offISO: off.toISOString(),
+          notifyISO: notifyAt.toISOString(),
+        });
+      } catch (e) {
+        console.error('scheduleNotification error:', e);
+      }
     }
 
     const flex = buildClockInFlex({

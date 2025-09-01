@@ -1,9 +1,7 @@
 import { google } from 'googleapis';
 
 const SHEET_ID = process.env.SHEET_ID;
-const KEY_FILE =
-  process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-  '/etc/secrets/service-account.json';
+const KEY_FILE = process.env.GOOGLE_APPLICATION_CREDENTIALS || '/etc/secrets/service-account.json';
 
 async function getSheetsClient() {
   const auth = new google.auth.GoogleAuth({
@@ -30,7 +28,7 @@ export async function ensureHeaders() {
         requestBody: { values: [['User ID', '日期', '上班時間', '預估下班時間']] }
       });
     }
-  } catch (e) {
+  } catch {
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: '打卡紀錄!A1:D1',
@@ -40,7 +38,6 @@ export async function ensureHeaders() {
   }
 }
 
-// ---- 通知排程 Sheet: A=userId, B=日期(YYYY/MM/DD), C=上班時間, D=offISO, E=notifyISO, F=notified ----
 export async function ensureScheduleHeaders() {
   const sheets = await getSheetsClient();
   try {
@@ -57,8 +54,14 @@ export async function ensureScheduleHeaders() {
         requestBody: { values: [['User ID','日期','上班時間','OffISO','NotifyISO','Notified']] }
       });
     }
-  } catch (e) {
-    await sheets.spreadsheets.values.update({
+  } catch {
+    // 分頁不存在 → 建立再寫表頭
+    const sheetsApi = await getSheetsClient();
+    await sheetsApi.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: '通知排程' } } }] }
+    });
+    await sheetsApi.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: '通知排程!A1:F1',
       valueInputOption: 'RAW',
@@ -147,7 +150,6 @@ export async function hasRecordForDate(userId, dateStr) {
   return false;
 }
 
-// ---- 通知排程：建立、查 due、標記已通知 ----
 export async function scheduleNotification({ userId, dateStr, startStr, offISO, notifyISO }) {
   const sheets = await getSheetsClient();
   await sheets.spreadsheets.values.append({
@@ -158,7 +160,6 @@ export async function scheduleNotification({ userId, dateStr, startStr, offISO, 
   });
 }
 
-// 取得所有 notifyISO <= nowISO 且 Notified != TRUE 的項目（回傳附 rowIndex）
 export async function getDueNotifications(nowISO) {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
@@ -175,7 +176,7 @@ export async function getDueNotifications(nowISO) {
     if (!notifyISO) continue;
     if (new Date(notifyISO).toISOString() <= new Date(nowISO).toISOString()) {
       due.push({
-        rowIndex: i + 2, // 1-based（含表頭）
+        rowIndex: i + 2,
         userId,
         dateStr,
         startStr,
@@ -197,7 +198,6 @@ export async function markNotified(rowIndex) {
   });
 }
 
-// 工具：YYYY/MM/DD -> 中文日期
 function toChinese(dateStr) {
   const d = normalizeDateStr(dateStr);
   const parts = d.split('/');
