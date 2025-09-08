@@ -27,7 +27,6 @@ const {
   ALLOWED_USER_IDS = '',
   FAMILY_USER_IDS = '',
   FAMILY_GROUP_IDS = '',
-  FAMILY_NOTIFY_LEAD_MINUTES = 15,
   NOTIFY_FIRST_CLOCK_ONLY = '1',
   CRON_KEY = '',
   NOTIFY_MAX_LAG_MINUTES = '240'
@@ -201,7 +200,7 @@ async function checkAndNotifyDue() {
     const MAX_LAG_MIN = Number(NOTIFY_MAX_LAG_MINUTES || 240);
 
     const tasks = due.map(async item => {
-      // 過期太久就不補發，只標記已通知以防止重複
+      // 過期太久就不補發
       const lagMs = Date.now() - new Date(item.offISO).getTime();
       if (lagMs > MAX_LAG_MIN * 60 * 1000) {
         await markNotified(item.rowIndex);
@@ -209,10 +208,10 @@ async function checkAndNotifyDue() {
       }
       const endStr = new Date(item.offISO).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE });
       const text =
-        `📣 即將到達最早下班時間\n` +
+        `📣 下班提醒\n` +
         `📅 ${item.dateZh}\n` +
         `🕗 上班：${item.startStr}\n` +
-        `🕔 最早下班：${endStr}`;
+        `🕔 預估下班：${endStr}`;
       await notifyFamily(text);
       await markNotified(item.rowIndex);
     });
@@ -222,11 +221,11 @@ async function checkAndNotifyDue() {
   }
 }
 
-// 每 60 秒檢查一次；服務啟動時先掃一次
+// 每 60 秒檢查一次
 setInterval(checkAndNotifyDue, 60 * 1000);
 checkAndNotifyDue();
 
-// 手動 / Cron 觸發（帶密碼保護）
+// Cron 觸發
 app.get('/tasks/notify-due', async (req, res) => {
   if (CRON_KEY && req.query.key !== CRON_KEY) {
     return res.status(403).send('Forbidden');
@@ -273,7 +272,7 @@ async function handleEvent(event) {
   // 白名單限制
   if (isProtectedCmd && !isEmployee(userId)) {
     return client.replyMessage(event.replyToken, { type: 'text', text: '此功能僅限本人使用。' });
-    }
+  }
 
   await ensureHeaders();
   try { await ensureScheduleHeaders(); } catch (e) { console.error('ensureScheduleHeaders error:', e); }
@@ -304,15 +303,17 @@ async function handleEvent(event) {
     }
 
     if (shouldSchedule) {
-      const leadMin = Number(FAMILY_NOTIFY_LEAD_MINUTES) || 15;
-      const notifyAt = new Date(off.getTime() - leadMin * 60 * 1000);
       try {
+        // 固定當天 17:30 通知
+        const fixed1730 = new Date(now);
+        fixed1730.setHours(17, 30, 0, 0);
+
         await scheduleNotification({
           userId,
           dateStr,
           startStr,
           offISO: off.toISOString(),
-          notifyISO: notifyAt.toISOString(),
+          notifyISO: fixed1730.toISOString()
         });
       } catch (e) {
         console.error('scheduleNotification error:', e);
@@ -361,3 +362,4 @@ async function handleEvent(event) {
 }
 
 app.listen(PORT, () => console.log('✅ Server running on port ' + PORT));
+
